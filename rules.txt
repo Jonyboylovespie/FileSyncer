@@ -1,0 +1,3 @@
+# FileSyncer rules - one rule per line
+# Format: appExe|localPath|serverPath
+C:\Users\Jonat\AppData\Local\Programs\Zed\Zed.exe|C:\Users\Jonat\AppData\Roaming\Zed\settings.json|C:\Users\Jonat\My Drive\FilesToSync\settings.json

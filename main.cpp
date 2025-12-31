@@ -19,12 +19,12 @@
 // - Copy behavior:
 //   - Directories: mirrored using robocopy (/MIR)
 //   - Files: copied using SHFileOperationW
-//
-// Build with: g++ -std=c++17 -O2 -mwindows -municode -DUNICODE -D_UNICODE main.cpp -o FileSyncer.exe -lole32 -loleaut32 -lwbemuuid -lcomctl32 -lshlwapi -lshell32
+// Command:
+// cl /EHsc /std:c++17 /O2 /DUNICODE /D_UNICODE /FeFileSyncer.exe main.cpp ole32.lib oleaut32.lib wbemuuid.lib comctl32.lib shlwapi.lib shell32.lib gdi32.lib /link /SUBSYSTEM:WINDOWS
 
 #include <windows.h>
 #include <commctrl.h>
-#include <shlwapi.h>v
+#include <shlwapi.h>
 #include <shellapi.h>
 #include <wbemidl.h>
 #include <comdef.h>

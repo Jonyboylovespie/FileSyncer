@@ -207,6 +207,39 @@ static bool EnsureDirectoryExists(const std::wstring& dirPath) {
 // Forward declaration: sync helpers log failures.
 static void AppendLogLine(const std::wstring& line);
 
+#pragma comment(lib, "mpr.lib")
+#include <winnetwk.h>
+
+static void RefreshNetworkShareConnection(const std::wstring& path) {
+    // Only interested in UNC paths: \\server\share...
+    if (path.size() < 3 || path[0] != L'\\' || path[1] != L'\\') return;
+
+    // Find the server/share part. 
+    // Format: \\server\share\remainder
+    size_t serverEnd = path.find(L'\\', 2);
+    if (serverEnd == std::wstring::npos) return; // Just \\server ?
+
+    size_t shareEnd = path.find(L'\\', serverEnd + 1);
+    std::wstring sharePath;
+    if (shareEnd == std::wstring::npos) {
+        sharePath = path;
+    } else {
+        sharePath = path.substr(0, shareEnd);
+    }
+
+    // Drop any existing connection to force a refresh
+    WNetCancelConnection2W(sharePath.c_str(), 0, FALSE);
+
+    // Re-establish using current user context
+    NETRESOURCEW nr{};
+    nr.dwType = RESOURCETYPE_DISK;
+    nr.lpRemoteName = const_cast<wchar_t*>(sharePath.c_str());
+    nr.lpLocalName = nullptr;
+    nr.lpProvider = nullptr;
+
+    WNetAddConnection2W(&nr, nullptr, nullptr, 0);
+}
+
 // Copy a single file using SHFileOperationW.
 static bool CopyFileShFileOp(const std::wstring& src, const std::wstring& dst) {
     if (src.empty() || dst.empty()) return false;
@@ -386,47 +419,21 @@ static std::wstring RuleToDisplayLine(const SyncRule& r) {
 // Forward declaration: used by AddRule (defined later).
 static void ReloadRulesListUIFromState();
 
-static int FindRuleIndexByAppNorm(const std::wstring& appExeNorm) {
-    std::lock_guard<std::mutex> lock(g_app.rulesMutex);
-    for (size_t i = 0; i < g_app.rules.size(); ++i) {
-        if (g_app.rules[i].appExeNorm == appExeNorm) return (int)i;
-    }
-    return -1;
-}
-
-static bool TryGetRuleByAppNorm(const std::wstring& appExeNorm, SyncRule& outRule) {
-    std::lock_guard<std::mutex> lock(g_app.rulesMutex);
-    for (const auto& r : g_app.rules) {
-        if (r.appExeNorm == appExeNorm) {
-            outRule = r;
-            return true;
-        }
-    }
-    return false;
-}
-
 static void AddRule(const std::wstring& appExeRaw, const std::wstring& localRaw, const std::wstring& serverRaw) {
     SyncRule r;
     r.appExe = Trim(StripWrappingQuotes(appExeRaw));
     r.localPath = Trim(StripWrappingQuotes(localRaw));
     r.serverPath = Trim(StripWrappingQuotes(serverRaw));
     r.appExeNorm = NormalizePath(r.appExe);
-
     if (r.appExeNorm.empty() || r.localPath.empty() || r.serverPath.empty()) return;
-
+    std::wstring lNorm = NormalizePath(r.localPath), sNorm = NormalizePath(r.serverPath);
     {
         std::lock_guard<std::mutex> lock(g_app.rulesMutex);
-        // one rule per app path (replace existing)
-        for (auto& existing : g_app.rules) {
-            if (existing.appExeNorm == r.appExeNorm) {
-                existing = r;
-                ReloadRulesListUIFromState();
-                return;
-            }
+        for (const auto& ex : g_app.rules) {
+            if (ex.appExeNorm == r.appExeNorm && NormalizePath(ex.localPath) == lNorm && NormalizePath(ex.serverPath) == sNorm) return;
         }
         g_app.rules.push_back(r);
     }
-
     SendMessageW(g_app.hRulesList, LB_ADDSTRING, 0, (LPARAM)RuleToDisplayLine(r).c_str());
 }
 
@@ -727,11 +734,33 @@ public:
         const std::wstring& dst = (direction == L"Server->Local") ? r.localPath : r.serverPath;
 
         if (!PathExistsAny(src)) {
-            SYSTEMTIME st2 = NowLocalTime();
-            std::wstringstream err;
-            err << L"[" << FormatTimestamp(st2) << L"] ERROR  Source does not exist: " << src;
-            PostUILog(err.str());
-            return;
+            DWORD gle = GetLastError();
+
+            // If we get "Logon failure" (1326) or "Access denied" (5), try refreshing the share connection
+            if (gle == ERROR_LOGON_FAILURE || gle == ERROR_ACCESS_DENIED) {
+                RefreshNetworkShareConnection(src);
+                // Check again
+                if (PathExistsAny(src)) {
+                    gle = 0; // Recovered
+                } else {
+                    gle = GetLastError(); // Still failing
+                }
+            }
+
+            if (gle != 0) {
+                // Capture the last error from the failing GetFileAttributesW
+                wchar_t msgbuf[512] = {0};
+                FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                               nullptr, gle, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                               msgbuf, (DWORD)_countof(msgbuf), nullptr);
+
+                SYSTEMTIME st2 = NowLocalTime();
+                std::wstringstream errss;
+                errss << L"[" << FormatTimestamp(st2) << L"] ERROR  Source does not exist: " << src
+                      << L"  (GetFileAttributesW error=" << gle << L", msg=\"" << msgbuf << L"\")";
+                PostUILog(errss.str());
+                return;
+            }
         }
 
         bool ok = SyncCopyPath(src, dst);
@@ -778,14 +807,19 @@ public:
                         m_pidToExeDisplay[pid] = exe;
                     }
 
-                    SyncRule rule;
-                    if (TryGetRuleByAppNorm(exeNorm, rule)) {
+                    std::vector<SyncRule> matches;
+                    {
+                        std::lock_guard<std::mutex> lock(g_app.rulesMutex);
+                        for (const auto& r : g_app.rules) {
+                            if (r.appExeNorm == exeNorm) matches.push_back(r);
+                        }
+                    }
+                    if (!matches.empty()) {
                         SYSTEMTIME st = NowLocalTime();
                         std::wstringstream ss;
                         ss << L"[" << FormatTimestamp(st) << L"] START  " << exe << L"  (PID " << pid << L")";
                         PostUILog(ss.str());
-
-                        DoSyncCopy(L"Server->Local", rule);
+                        for (const auto& rule : matches) DoSyncCopy(L"Server->Local", rule);
                     }
                 }
             } else if (className == L"Win32_ProcessStopTrace") {
@@ -806,14 +840,19 @@ public:
                 }
 
                 if (!exeNorm.empty()) {
-                    SyncRule rule;
-                    if (TryGetRuleByAppNorm(exeNorm, rule)) {
+                    std::vector<SyncRule> matches;
+                    {
+                        std::lock_guard<std::mutex> lock(g_app.rulesMutex);
+                        for (const auto& r : g_app.rules) {
+                            if (r.appExeNorm == exeNorm) matches.push_back(r);
+                        }
+                    }
+                    if (!matches.empty()) {
                         SYSTEMTIME st = NowLocalTime();
                         std::wstringstream ss;
                         ss << L"[" << FormatTimestamp(st) << L"] STOP   " << exeDisp << L"  (PID " << pid << L")";
                         PostUILog(ss.str());
-
-                        DoSyncCopy(L"Local->Server", rule);
+                        for (const auto& rule : matches) DoSyncCopy(L"Local->Server", rule);
                     }
                 }
             }
